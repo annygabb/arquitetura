@@ -1,0 +1,267 @@
+# SAD — Software Architecture Document
+## HealthSync — Sistema de Monitoramento e Suporte à Decisão Clínica
+### Fase 4 — Documento de Arquitetura de Software (Ciclos 1–3 Consolidados)
+
+---
+
+## 1. Visão Executiva do Sistema
+
+O **HealthSync** resolve a fragmentação do cuidado remoto ao unificar teleconsultas, dados de dispositivos IoT (wearables) e suporte à decisão clínica via IA em uma única interface integrada. O problema central endereçado é a ausência de monitoramento contínuo e personalizado, que frequentemente retarda diagnósticos críticos e compromete a qualidade do atendimento.
+
+O sistema opera no mercado de *digital health*, exigindo democratização do acesso à saúde com rigorosa proteção de dados (LGPD/HIPAA). Os usuários principais são: **pacientes** (monitoramento e conveniência), **médicos** (dados precisos para diagnóstico) e **administradores** (gestão da rede de atendimento).
+
+**Estado atual na Fase 4:** arquitetura completamente documentada com decisões de cloud, estratégias de resiliência e modelo de comunicação definidos. O sistema está pronto para implantação em ambiente de nuvem com infraestrutura escalável e resiliente.
+
+---
+
+## 2. Atributos de Qualidade Priorizados (RNFs)
+
+| RNF | Prioridade | Justificativa |
+|---|---|---|
+| **Segurança** | Crítica | LGPD/HIPAA — dados sensíveis de saúde; criptografia E2E + RBAC |
+| **Disponibilidade** | Alta | SLA 99,9% — impacto direto em emergências médicas |
+| **Escalabilidade** | Alta | Picos sazonais + fluxo massivo de dados IoT |
+| **Integridade de Dados** | Crítica | Diagnósticos dependem de dados corretos e íntegros |
+| **Interoperabilidade** | Alta | HL7/FHIR — integração com sistemas hospitalares (HIS) |
+
+---
+
+## 3. Estilo Arquitetural
+
+O HealthSync adota **Arquitetura Hexagonal (Ports & Adapters)** com **Clean Architecture**, estruturada sobre um **Monólito Modular**. Essa combinação garante:
+
+- Isolamento completo do domínio das dependências externas (banco de dados, APIs, frameworks).
+- Flexibilidade para extração futura de módulos como microsserviços.
+- Conformidade com LGPD/HIPAA por meio de controles de acesso centralizados no domínio.
+- Testabilidade elevada das regras de negócio críticas de saúde.
+
+### Diagrama C4 — Nível 2 (Containers)
+
+```mermaid
+C4Container
+    title HealthSync — Diagrama de Containers (C4 Nível 2)
+
+    Person(paciente, "Paciente", "Monitora saúde e realiza teleconsultas")
+    Person(medico, "Médico", "Acessa dados clínicos e realiza diagnósticos")
+    Person(admin, "Administrador", "Gerencia usuários e monitora a plataforma")
+
+    System_Boundary(healthsync, "HealthSync") {
+        Container(frontend, "Frontend Web", "Angular", "Interface única para todos os usuários")
+        Container(api, "API REST + Serviço IA", "Node.js / NestJS", "Orquestra lógica de negócio e IA interna")
+        Container(db, "Banco de Dados", "PostgreSQL", "Armazena perfis, consultas e prontuários")
+        Container(queue, "Fila de Mensagens", "RabbitMQ", "Mediador assíncrono para IoT, HIS e notificações")
+    }
+
+    System_Ext(wearables, "Wearables / IoT", "Dispositivos de monitoramento biométrico")
+    System_Ext(ai_ext, "APIs de IA Externas", "Diagnósticos e análises avançadas")
+    System_Ext(his, "Sistemas Hospitalares (HIS)", "Prontuários eletrônicos via HL7/FHIR")
+    System_Ext(notif, "Serviço de Notificações", "Gateway de SMS e e-mail")
+
+    Rel(paciente, frontend, "Acessa via HTTPS")
+    Rel(medico, frontend, "Acessa via HTTPS")
+    Rel(admin, frontend, "Acessa via HTTPS")
+    Rel(frontend, api, "REST/HTTPS")
+    Rel(api, db, "SQL")
+    Rel(api, queue, "AMQP")
+    Rel(wearables, api, "HTTPS / MQTT")
+    Rel(queue, ai_ext, "HTTPS/REST")
+    Rel(queue, his, "HL7 / FHIR")
+    Rel(queue, notif, "SMTP / SMS")
+```
+
+---
+
+## 4. Decisões Arquiteturais (ADRs)
+
+| ADR | Título | Status |
+|---|---|---|
+| [ADR-001](../adrs/0001-estrategia-nuvem.md) | Estratégia de Nuvem e Escalabilidade | Aceito |
+| [ADR-002](../adrs/adr-002-persistenciahexagonal.md) | Persistência com Isolamento via Ports & Adapters | Aceito |
+| [ADR-003](../adrs/0003-modelo-comunicacao.md) | Modelo de Comunicação: Síncrono vs. Assíncrono | Aceito |
+
+---
+
+## 5. Ciclo 3 — Cloud e Resiliência
+
+### 5.1 Estratégia de Cloud e Implantação
+
+O HealthSync será implantado na **Amazon Web Services (AWS)**, adotando um modelo **híbrido PaaS + Serverless**, que equilibra controle operacional, custo e escalabilidade automática.
+
+#### Modelo de Serviço
+
+| Componente | Modelo | Serviço AWS |
+|---|---|---|
+| API REST Core | PaaS (Containers) | AWS ECS Fargate |
+| Banco de Dados PostgreSQL | PaaS Gerenciado | Amazon RDS Multi-AZ |
+| Fila de Mensagens | PaaS Gerenciado | Amazon SQS |
+| Módulo HIS Integration | Serverless | AWS Lambda |
+| Serviço de Notificações | Serverless | AWS Lambda + Amazon SNS |
+| Frontend Web | CDN + Serverless | Amazon CloudFront + S3 |
+| API Gateway | PaaS Gerenciado | AWS API Gateway |
+
+#### Escalabilidade
+
+A escalabilidade é garantida por dois mecanismos complementares:
+
+**Horizontal (Auto Scaling):** o ECS Fargate escala automaticamente o número de containers da API com base em métricas de CPU e latência (target: < 200ms p95). Em picos sazonais (ex: surtos de gripe), novas instâncias sobem em menos de 60 segundos.
+
+**Vertical (RDS):** o Amazon RDS Multi-AZ permite upgrades de instância com failover automático, garantindo a integridade do banco durante operações de manutenção.
+
+**Ingestão IoT:** o Amazon SQS com *dead-letter queue* absorve picos de dados biométricos sem degradar a API principal. A fila pode acumular mensagens durante picos e processar gradualmente após a estabilização.
+
+#### Monitoramento
+
+- **Amazon CloudWatch:** métricas de infraestrutura (CPU, memória, latência, erros 5xx).
+- **AWS X-Ray:** rastreamento distribuído de requisições entre containers e Lambdas.
+- **Alertas automáticos:** SNS notifica a equipe de operações quando SLA é ameaçado (latência > 500ms ou taxa de erro > 0,1%).
+- **Dashboards operacionais:** CloudWatch Dashboards com KPIs críticos visíveis para o time de operações 24/7.
+
+#### Implantação
+
+O pipeline de CI/CD é gerenciado via **GitHub Actions + AWS CodeDeploy**, com estratégia de *blue/green deployment* para garantir zero downtime em atualizações. O ambiente conta com três estágios: desenvolvimento, homologação e produção, com promoção controlada por aprovação manual no estágio de produção.
+
+---
+
+### 5.2 Análise de Fragilidade e Mitigação
+
+#### Ponto Frágil Principal: Fila de Mensagens como Single Point of Coordination
+
+A fila de mensagens (Amazon SQS) é o componente central de desacoplamento do HealthSync. Em um cenário de produção, uma falha ou saturação da fila interromperia simultaneamente: a ingestão de dados IoT, a integração com sistemas HIS e o disparo de notificações críticas. Apesar de o SQS ser um serviço gerenciado de alta disponibilidade, o risco está na **lógica dos consumers** (processadores de mensagens) que podem acumular backlog em picos extremos.
+
+**Risco secundário:** a dependência de APIs de IA externas para suporte à decisão clínica. Uma indisponibilidade prolongada dessas APIs pode degradar a qualidade dos diagnósticos assistidos, mesmo que o sistema central permaneça operacional.
+
+#### Estratégias de Mitigação
+
+**1. Circuit Breaker (Padrão de Resiliência Principal)**
+
+Implementado via biblioteca **Resilience4j** nos consumers da fila que consomem as APIs de IA externas e os sistemas HIS. O circuit breaker opera em três estados:
+
+- **Fechado:** operação normal, requisições fluem normalmente.
+- **Aberto:** após N falhas consecutivas, as chamadas externas são bloqueadas por um período configurável (ex: 30s), retornando imediatamente um fallback.
+- **Semi-aberto:** testa gradualmente se o serviço externo se recuperou.
+
+**2. Fallback Clínico**
+
+Quando a API de IA externa está indisponível (circuit aberto), o sistema utiliza o **Serviço de IA interno** do núcleo HealthSync como fallback, garantindo que médicos continuem recebendo suporte à decisão, ainda que com menor poder analítico.
+
+**3. Dead-Letter Queue (DLQ)**
+
+Mensagens que falham após 3 tentativas de processamento são movidas automaticamente para uma fila de *dead-letters*, permitindo análise, reprocessamento manual e auditoria sem perda de dados clínicos.
+
+**4. Retry com Exponential Backoff**
+
+Todas as integrações externas implementam retry com backoff exponencial (1s → 2s → 4s → 8s) para absorver indisponibilidades transitórias sem sobrecarregar os serviços externos.
+
+**5. Multi-AZ e Failover Automático**
+
+O Amazon RDS Multi-AZ garante failover automático do banco de dados em menos de 60 segundos. O ECS Fargate distribui containers entre múltiplas Availability Zones, eliminando o risco de falha de datacenter único.
+
+**6. Rate Limiting e Bulkhead**
+
+O AWS API Gateway implementa rate limiting por usuário/tenant para prevenir ataques DDoS e proteger o núcleo da API. O padrão Bulkhead isola os pools de threads para cada integração externa, evitando que a lentidão de um sistema HIS consuma recursos de outros serviços.
+
+---
+
+### 5.3 Parecer Técnico Final
+
+A arquitetura HealthSync representa a escolha técnica mais adequada para os requisitos de negócio porque equilibra três dimensões críticas do domínio de saúde digital: **segurança por design**, **resiliência operacional** e **evolução controlada**.
+
+A adoção da Arquitetura Hexagonal sobre Monólito Modular garante que as regras de negócio clínicas — o ativo mais crítico do sistema — permaneçam isoladas de decisões tecnológicas, permitindo trocar banco de dados, APIs de IA ou protocolos de integração sem risco de regressão no domínio. A implantação em AWS com modelo híbrido PaaS/Serverless entrega o SLA de 99,9% exigido com custo operacional otimizado: serviços de alta frequência (API Core) em containers permanentes, e serviços de baixa frequência (notificações, integração HIS) em Lambdas que cobram apenas por execução.
+
+O modelo de comunicação híbrido (síncrono para interações de usuário, assíncrono para IoT e integrações externas) garante que picos de 10.000 wearables simultâneos não degradem a experiência de teleconsulta. As estratégias de resiliência — Circuit Breaker, DLQ, Multi-AZ e fallback clínico — protegem o sistema em cenários de falha parcial, que são inevitáveis em qualquer ecossistema distribuído de produção.
+
+O valor agregado para o cliente é a **confiabilidade como vantagem competitiva**: em um mercado onde falhas de sistema têm impacto direto na saúde humana, uma arquitetura que degrada graciosamente em vez de falhar catastroficamente é o diferencial que separa uma startup de saúde digital responsável de uma plataforma de alto risco regulatório.
+
+---
+
+## 6. Matriz de Rastreabilidade — RNF → Decisão Arquitetural
+
+| RNF | Prioridade | Decisão / ADR | Componente Responsável |
+|---|---|---|---|
+| Segurança | Crítica | ADR-002 — Hexagonal + RBAC | AuthService / PortsLayer |
+| Disponibilidade | Alta | ADR-001 — Multi-AZ + Fila SQS | ECS Fargate / RDS Multi-AZ |
+| Escalabilidade | Alta | ADR-001 — Auto Scaling Horizontal | ECS Auto Scaling / SQS |
+| Integridade de Dados | Crítica | ADR-002 — PostgreSQL + domínio isolado | DomainEntities / Repositórios |
+| Interoperabilidade | Alta | ADR-003 — Adaptadores HL7/FHIR assíncronos | HIS IntegrationModule / Lambda |
+
+---
+
+## 7. Fluxo Técnico — Comunicação (Visão Consolidada)
+
+```
+[Wearable / Sensor IoT]
+        |
+        v (HTTPS / MQTT)
+[AWS API Gateway]
+        |
+        v
+[API REST — HealthSync Core (ECS Fargate)]
+        |
+   -----+-------------------------------
+   |                                   |
+   v (SQL)                             v (AMQP)
+[RDS PostgreSQL]              [Amazon SQS — Fila de Mensagens]
+                                        |
+                          ------+-------+--------+
+                          |             |        |
+                          v             v        v
+                   [Lambda: AI    [Lambda:   [Lambda:
+                    Ext. Adapter]  HIS/FHIR]  Notificações]
+                          |             |        |
+                          v             v        v
+                   [API IA Ext.]  [HIS/EHR]  [SNS/SMS/Email]
+```
+
+---
+
+## 8. Como Executar o Projeto Localmente
+
+### Pré-requisitos
+
+- Node.js 20+
+- Docker e Docker Compose
+- Git
+
+### Passos
+
+```bash
+# 1. Clonar o repositório
+git clone https://github.com/annygabb/arquitetura.git
+cd arquitetura
+
+# 2. Subir infraestrutura local (PostgreSQL + RabbitMQ)
+docker-compose up -d
+
+# 3. Instalar dependências do backend
+cd src
+npm install
+
+# 4. Configurar variáveis de ambiente
+cp .env.example .env
+# Editar .env com as configurações locais
+
+# 5. Executar migrations do banco
+npm run migration:run
+
+# 6. Iniciar a API
+npm run start:dev
+
+# 7. Iniciar o Frontend (em outro terminal)
+cd ../frontend
+npm install
+npm start
+```
+
+O sistema estará disponível em `http://localhost:4200` (frontend) e `http://localhost:3000/api` (backend).
+
+---
+
+## 9. Referências Bibliográficas
+
+- PRESSMAN, Roger S. *Engenharia de Software: Uma Abordagem Profissional*. McGraw Hill, 2021.
+- RICHARDS, Mark; FORD, Neal. *Fundamentals of Software Architecture: An Engineering Approach*. O'Reilly Media, 2020.
+- MARTIN, Robert C. *Clean Architecture: A Craftsman's Guide to Software Structure and Design*. Prentice Hall, 2017.
+- RICHARDSON, Chris. *Microservices Patterns*. Manning Publications, 2018.
+- C4 MODEL FOR SOFTWARE ARCHITECTURE. Disponível em: https://c4model.com/. Acesso em: 2026.
+- ARCHITECTURE DECISION RECORDS (ADRs). Disponível em: https://adr.github.io/. Acesso em: 2026.
+- AWS WELL-ARCHITECTED FRAMEWORK. Disponível em: https://aws.amazon.com/architecture/well-architected/. Acesso em: 2026.
