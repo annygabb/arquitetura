@@ -1,0 +1,119 @@
+# ADR-0003 — Modelo de Comunicação: Síncrono vs. Assíncrono
+
+---
+
+## Contexto e Problema
+
+O HealthSync é uma plataforma de saúde digital que integra múltiplas fontes de dados e destinos de processamento: dispositivos wearables/IoT enviando biometria em tempo real, o núcleo de API REST orquestrando a lógica de negócio, APIs de IA externas realizando diagnósticos, sistemas hospitalares (HIS) sincronizando prontuários via HL7/FHIR e um serviço de notificações disparando alertas críticos por SMS/e-mail.
+
+Diante dessa topologia distribuída, surge a necessidade de definir **quando utilizar comunicação síncrona** (requisição/resposta imediata) e **quando utilizar comunicação assíncrona** (mediada por fila de mensagens), de modo a equilibrar:
+
+- Experiência do usuário (latência percebida em consultas e teleconsultas)
+- Disponibilidade e resiliência perante falhas de serviços externos
+- Throughput para o volume contínuo de dados IoT
+- Consistência de dados clínicos críticos
+
+A ausência de uma política clara de comunicação resulta em acoplamento forte entre serviços, risco de propagação de falhas e degradação do SLA de 99,9% exigido para um ambiente de saúde.
+
+---
+
+## Situação Anterior
+
+Na concepção inicial (Ciclo 1), toda a comunicação era tratada de forma síncrona: a API REST aguardava resposta das APIs de IA externas e dos sistemas HIS antes de retornar ao frontend. Esse modelo gerou dois problemas evidentes:
+
+1. **Latência em cascata:** uma lentidão no sistema hospitalar parceiro bloqueava a thread da API principal, elevando o tempo de resposta percebido pelo médico.
+2. **Falha de disponibilidade:** uma indisponibilidade temporária da API de IA externa causava erro 500 para o usuário final, violando o SLA.
+
+---
+
+## Decisão Tomada
+
+Adotar um **modelo híbrido de comunicação**, com regras claras de seleção:
+
+### Comunicação Síncrona (REST/HTTPS) — quando usar
+- Interações usuário-sistema em tempo real: autenticação, consulta de histórico clínico, teleconsulta.
+- Requisições onde o usuário aguarda a resposta para continuar o fluxo.
+- Chamadas internas entre módulos do monólito (domínio ↔ repositórios).
+
+### Comunicação Assíncrona (Fila de Mensagens) — quando usar
+- Ingestão de dados biométricos de wearables/IoT (alto volume, tolerância a pequenos atrasos).
+- Integração com APIs de IA externas para análise e diagnóstico complementar.
+- Sincronização de prontuários com sistemas HIS (consistência eventual aceita).
+- Disparo de alertas e notificações por SMS/e-mail.
+
+A fila de mensagens atua como **mediador assíncrono** e ponto de desacoplamento, permitindo que o núcleo HealthSync continue operacional mesmo quando sistemas externos estão lentos ou indisponíveis.
+
+---
+
+## Alternativas Consideradas e Rejeitadas
+
+| Alternativa | Motivo da Rejeição |
+|---|---|
+| **100% Síncrono** | Acoplamento forte; falha de HIS ou API de IA propaga para o usuário final; inviável para volume IoT. |
+| **100% Assíncrono (Event-driven puro)** | Teleconsultas e autenticação exigem resposta imediata; consistência eventual inaceitável para operações críticas de leitura clínica. |
+| **gRPC para comunicação interna** | Adiciona complexidade desnecessária em um monólito modular; REST já atende os requisitos internos com menor custo de desenvolvimento. |
+| **WebSockets para IoT** | Adequado para streaming bidirecional, porém aumenta a complexidade de gerenciamento de conexão persistente; MQTT/HTTPS sobre fila já resolve o caso de uso. |
+
+---
+
+## Análise de Trade-offs
+
+| Dimensão | Síncrono | Assíncrono (Fila) |
+|---|---|---|
+| **Latência percebida** | Baixa (resposta imediata) | Potencialmente maior (processamento diferido) |
+| **Disponibilidade** | Dependente do receptor | Alta (fila absorve falhas do receptor) |
+| **Acoplamento** | Alto (emissor espera receptor) | Baixo (emissor não conhece receptor) |
+| **Consistência** | Forte (resposta imediata confirma) | Eventual (confirmação assíncrona) |
+| **Throughput IoT** | Limitado (bloqueio por thread) | Alto (fila absorve picos) |
+| **Rastreabilidade** | Simples (trace por request) | Requer correlation ID na mensagem |
+| **Complexidade operacional** | Baixa | Média (broker, dead-letter queue, retry) |
+
+**Trade-off central:** aceita-se **consistência eventual** nas integrações com HIS e APIs de IA externas em troca de **alta disponibilidade e resiliência**. Para operações críticas de leitura (ex: médico acessando prontuário), mantém-se comunicação síncrona para garantir dados atualizados.
+
+---
+
+## Fundamentação Teórica
+
+Segundo **Richards e Ford (2020)**, em *Fundamentals of Software Architecture*, a escolha entre comunicação síncrona e assíncrona é uma das decisões arquiteturais mais impactantes em sistemas distribuídos. Os autores enfatizam que sistemas orientados a eventos com mensageria assíncrona aumentam significativamente a escalabilidade e a resiliência, ao custo de maior complexidade operacional e eventual consistência.
+
+**Pressman (2021)** destaca que, em sistemas de saúde críticos, a engenharia de software deve priorizar a **resiliência** como atributo de primeira classe, garantindo que falhas em subsistemas periféricos não comprometam o núcleo do sistema — premissa que fundamenta a adoção da fila de mensagens como isolador de falhas.
+
+O padrão **Saga** (RICHARDSON, 2018) e o conceito de **consistência eventual** são referências consolidadas para sistemas distribuídos que precisam de alta disponibilidade sem sacrificar a integridade do domínio.
+
+---
+
+## Consequências e Impactos
+
+**Positivos:**
+- O núcleo da API permanece responsivo mesmo durante lentidão de sistemas externos.
+- Picos de ingestão de dados IoT são absorvidos pela fila sem degradação do serviço ao usuário.
+- Desacoplamento facilita a substituição de adaptadores (ex: trocar provedor de SMS, mudar API de IA).
+- Resiliência alinhada ao SLA de 99,9% exigido.
+
+**Negativos / Riscos:**
+- Necessidade de implementar **correlation IDs** para rastreabilidade de mensagens assíncronas.
+- Risco de **dead-letter messages** (mensagens não processadas) exige monitoramento ativo da fila.
+- Consistência eventual nas integrações HIS requer comunicação clara com parceiros hospitalares sobre janelas de sincronização.
+
+---
+
+## Componentes Responsáveis
+
+| Comunicação | Componente | Protocolo |
+|---|---|---|
+| Frontend ↔ API Core | Frontend Web (Angular) / API REST | HTTPS/REST |
+| Wearables ↔ API Core | Dispositivos IoT | HTTPS / MQTT |
+| API Core ↔ Fila | MessageQueue | AMQP / RabbitMQ |
+| Fila ↔ API IA Externa | AI Adapter | HTTPS/REST |
+| Fila ↔ HIS | HIS Integration Module | HL7 / FHIR |
+| Fila ↔ Notificações | Notification Service | SMTP / SMS Gateway |
+
+---
+
+## Referências
+
+- PRESSMAN, Roger S. *Engenharia de Software: Uma Abordagem Profissional*. McGraw Hill, 2021.
+- RICHARDS, Mark; FORD, Neal. *Fundamentals of Software Architecture: An Engineering Approach*. O'Reilly Media, 2020.
+- RICHARDSON, Chris. *Microservices Patterns*. Manning Publications, 2018.
+- C4 MODEL FOR SOFTWARE ARCHITECTURE. Disponível em: https://c4model.com/. Acesso em: 2026.
+- ARCHITECTURE DECISION RECORDS (ADRs). Disponível em: https://adr.github.io/. Acesso em: 2026.
