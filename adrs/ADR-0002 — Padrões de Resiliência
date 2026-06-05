@@ -1,0 +1,115 @@
+# ADR-0002 — Padrões de Resiliência
+
+---
+
+## 1. Contexto e Problema
+
+Em um sistema de saúde digital, **falhas em cascata são inadmissíveis**. Se a API de IA externa para diagnóstico ficar lenta ou indisponível, essa lentidão não pode se propagar para as teleconsultas em tempo real. Da mesma forma, um pico de dados de wearables não pode derrubar o módulo de agendamento de consultas.
+
+A análise da arquitetura da Fase 2 revelou três pontos críticos de fragilidade:
+
+1. **Ausência de isolamento de falhas**: uma dependência lenta bloqueia threads do Core API, eventualmente esgotando o pool e derrubando todo o serviço (*cascading failure*);
+2. **Ponto único de entrada sem proteção**: o tráfego externo alcança os microserviços diretamente, sem throttling, autenticação centralizada ou roteamento inteligente;
+3. **Dependências externas sem fallback**: APIs de IA externas e sistemas HIS podem ter SLAs inferiores ao do HealthSync; sem estratégia de fallback, a disponibilidade do sistema é limitada pelo elo mais fraco.
+
+---
+
+## 2. Alternativas Consideradas
+
+### Alternativa A — Sem padrões de resiliência (estado atual)
+Dependências externas são chamadas de forma síncrona e direta. Simples de implementar, mas inaceitável para um contexto de saúde: uma API de IA com latência de 10s bloqueia threads por 10s, o que, sob carga, derruba o serviço.
+
+### Alternativa B — Retry com backoff exponencial apenas
+Retentar chamadas falhas reduz erros transitórios, mas não protege contra falhas sustentadas. Sem circuit breaker, o sistema continua tentando chamar um serviço que está derrubado, desperdiçando recursos.
+
+### Alternativa C — Circuit Breaker isolado
+Protege contra falhas sustentadas, mas sem isolamento de recursos (bulkhead), uma dependência lenta ainda pode esgotar o pool de threads compartilhado.
+
+### Alternativa D — Combinação API Gateway + Circuit Breaker + Bulkhead (escolhida)
+Aplicar os três padrões em camadas garante defesa em profundidade: o Gateway protege a borda, o Circuit Breaker protege integrações específicas e o Bulkhead isola o impacto de cada dependência. Essa abordagem é recomendada por Newman (2021) como estratégia de resiliência madura para sistemas de microsserviços.
+
+---
+
+## 3. Decisão
+
+**Adotar uma estratégia de resiliência em três camadas: AWS API Gateway na borda, Resilience4j (Circuit Breaker + Bulkhead) nas integrações críticas do Core API, e Retry com backoff exponencial para chamadas idempotentes.**
+
+### 3.1 API Gateway (camada de borda)
+
+O **AWS API Gateway** atua como ponto único de entrada para todos os clientes externos:
+
+- **Autenticação**: valida tokens JWT emitidos pelo Auth Service antes de encaminhar qualquer requisição;
+- **Throttling**: limita requisições por IP e por plano de uso (ex: 1.000 req/min para clientes padrão), protegendo os serviços internos de abusos e picos não planejados;
+- **Roteamento**: encaminha requisições ao serviço correto (Core API, IA Service) sem que o cliente precise conhecer a topologia interna;
+- **WAF integrado**: AWS WAF bloqueia padrões de ataque comuns (injeção SQL, XSS) antes que atinjam a aplicação.
+
+### 3.2 Circuit Breaker (Resilience4j)
+
+Implementado no Core API para proteger chamadas às APIs de IA externas e ao módulo HIS:
+
+```
+Estado FECHADO   → chamadas normais passam
+     ↓ (X% de falhas em janela de tempo)
+Estado ABERTO    → chamadas bloqueadas; fallback ativado imediatamente
+     ↓ (após timeout de recuperação)
+Estado SEMI-ABERTO → chamadas de teste; se OK, fecha; se falha, reabre
+```
+
+**Configuração proposta:**
+
+| Parâmetro | Valor | Justificativa |
+|---|---|---|
+| `failureRateThreshold` | 50% | Abre o circuito se metade das chamadas falhar |
+| `waitDurationInOpenState` | 30s | Tempo para a dependência se recuperar |
+| `slidingWindowSize` | 20 | Janela de avaliação de falhas |
+| `fallback` | Retorna último diagnóstico cacheado | Garante continuidade do atendimento |
+
+O fallback para a API de IA externa retorna o último resultado cacheado no Redis, permitindo que o médico continue o atendimento enquanto a integração se recupera.
+
+### 3.3 Bulkhead (isolamento de recursos)
+
+Cada integração externa possui um pool de threads dedicado, implementado via `@Bulkhead` do Resilience4j:
+
+| Pool | Threads | Protege |
+|---|---|---|
+| `his-pool` | 10 | Sincronização com sistemas hospitalares |
+| `ai-ext-pool` | 15 | APIs de IA externas |
+| `notification-pool` | 5 | Envio de SMS/e-mail |
+
+Dessa forma, mesmo que o sistema HIS fique saturado e esgote as 10 threads do `his-pool`, as 15 threads do `ai-ext-pool` permanecem disponíveis para análises diagnósticas.
+
+### 3.4 Retry com backoff exponencial
+
+Para operações **idempotentes** (ex: sincronização de prontuário com HIS), aplica-se retry com backoff exponencial para absorver falhas transitórias:
+
+- Máximo de 3 tentativas;
+- Intervalo: 1s → 2s → 4s;
+- Não aplicável a operações não-idempotentes (criação de registros) para evitar duplicatas.
+
+---
+
+## 4. Trade-offs
+
+| Dimensão | Benefício | Custo / Risco |
+|---|---|---|
+| Disponibilidade | Falhas em dependências externas não derrubam o núcleo; fallback garante continuidade | Fallback com dados cacheados pode estar desatualizado |
+| Complexidade | Cada padrão resolve um problema bem definido | Adiciona complexidade operacional; requer monitoramento dos estados do Circuit Breaker |
+| Latência | Bulkhead elimina *thread starvation*; Gateway elimina chamadas maliciosas | Overhead mínimo de interceptação do Resilience4j (~microsegundos) |
+| Segurança | WAF e throttling no Gateway reduzem superfície de ataque | Configuração incorreta do WAF pode bloquear tráfego legítimo |
+
+---
+
+## 5. Consequências
+
+- O sistema mantém disponibilidade de teleconsultas mesmo durante falhas de APIs externas;
+- O SLA de 99,9% torna-se tecnicamente alcançável mesmo com dependências de menor disponibilidade;
+- A equipe precisará monitorar métricas de Circuit Breaker (estado aberto/fechado) via CloudWatch para reagir a falhas de integrações.
+
+---
+
+## 6. Referências
+
+- NEWMAN, Sam. *Building Microservices*. O'Reilly Media, 2021. Cap. 12 (Resiliência).
+- RICHARDS, Mark; FORD, Neal. *Fundamentals of Software Architecture*. O'Reilly Media, 2020. Cap. 16 (Microservices Architecture).
+- RESILIENCE4J. *Documentation — Circuit Breaker*. Disponível em: https://resilience4j.readme.io/
+- AWS. *API Gateway Developer Guide*. Disponível em: https://docs.aws.amazon.com/apigateway/
