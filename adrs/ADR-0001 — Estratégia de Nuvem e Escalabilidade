@@ -1,0 +1,85 @@
+# ADR-0001 — Estratégia de Nuvem e Escalabilidade
+
+---
+
+## 1. Contexto e Problema
+
+Com a conclusão da Fase 2, o HealthSync possui uma arquitetura Hexagonal sobre Monólito Modular que resolve os requisitos funcionais e garante a qualidade interna do código. No entanto, a implantação em produção expõe limitações críticas:
+
+- **Escalabilidade vertical limitada**: um único servidor não suporta picos de tráfego (ex: surtos de gripe com multiplicação repentina de acessos) nem o fluxo contínuo de dados de milhares de wearables simultâneos;
+- **Disponibilidade frágil**: sem redundância geográfica, uma falha de zona de disponibilidade derruba toda a plataforma, violando o SLA de 99,9%;
+- **Gestão de infraestrutura dispendiosa**: manter servidores físicos exige equipe de operações dedicada, incompatível com o estágio de startup da HealthSync;
+- **Conformidade LGPD/HIPAA**: o armazenamento de dados de saúde exige regiões certificadas e controles de auditoria que provedores de nuvem oferecem nativamente.
+
+A decisão é, portanto, qual **modelo de serviço de nuvem** e qual **estratégia de escalabilidade** adotar para o HealthSync em produção.
+
+---
+
+## 2. Alternativas Consideradas
+
+### Alternativa A — IaaS puro (ex: EC2 self-managed)
+Gerenciamento completo de VMs. Máxima flexibilidade, mas alto custo operacional e responsabilidade integral sobre SO, patches e alta disponibilidade. Incompatível com o tamanho atual da equipe.
+
+### Alternativa B — PaaS gerenciado (ex: AWS ECS Fargate + RDS)
+Containers gerenciados sem gestão de servidor. A AWS cuida de provisionamento, patching e escalonamento da infraestrutura; a equipe cuida apenas do código e da configuração dos serviços. Reduz o *operational overhead* sem abrir mão do controle sobre a lógica de implantação.
+
+### Alternativa C — Serverless total (ex: AWS Lambda + DynamoDB)
+Custo proporcional ao uso, escala automática. Ideal para cargas imprevisíveis. Porém, o modelo de execução stateless com *cold starts* é problemático para serviços de baixa latência como teleconsultas em tempo real, e a migração de um domínio rico em Spring Boot para Lambda exigiria reescrita significativa.
+
+### Alternativa D — Modelo Híbrido PaaS + Serverless (escolhida)
+Serviços de baixa latência e estado persistente rodam em **ECS Fargate**; funções de processamento eventual (ingestão IoT, análise de IA) rodam em **AWS Lambda**. Combina previsibilidade de custo, baixa latência onde necessário e escala elástica onde o volume é imprevisível.
+
+---
+
+## 3. Decisão
+
+**Adotar AWS como provedor de nuvem com modelo híbrido PaaS (ECS Fargate) + Serverless (Lambda), implantado em múltiplas zonas de disponibilidade (Multi-AZ) na região `sa-east-1` (São Paulo).**
+
+### Arquitetura de implantação
+
+| Componente | Serviço AWS | Justificativa |
+|---|---|---|
+| Core API | ECS Fargate | Latência previsível; estado de sessão; Spring Boot |
+| Auth Service | ECS Fargate | Token signing requer baixa latência constante |
+| Serviço de IA | AWS Lambda | Invocação eventual; escala automática por pico |
+| IoT Ingestor | AWS IoT Core + Lambda | Nativo para protocolo MQTT; escala por dispositivo |
+| Frontend | S3 + CloudFront | Distribuição global com CDN; zero gestão de servidor |
+| Banco relacional | Amazon RDS PostgreSQL Multi-AZ | HA automática; failover automático em < 60s |
+| Banco de séries temporais | Amazon Timestream | Otimizado para dados IoT com retenção automática |
+| Filas | Amazon SQS | Desacoplamento; reentrega automática |
+| Observabilidade | CloudWatch + X-Ray | Traces distribuídos; alertas; dashboards |
+
+### Estratégia de escalabilidade
+
+- **Horizontal** (preferencial): ECS Fargate escala o número de tasks com base em métricas de CPU/memória e filas SQS via *Application Auto Scaling*. Permite crescimento sem degradação, conforme prescrito por Richards e Ford (2020) ao tratar de elasticidade em sistemas distribuídos;
+- **Vertical** (pontual): o tipo de instância RDS pode ser promovido sem migração de dados (ex: `db.t3.medium` → `db.r6g.large`) para acomodar crescimento estrutural do volume de dados;
+- **Cache**: Amazon ElastiCache (Redis) para tokens de sessão e resultados frequentes de consulta, reduzindo carga no RDS.
+
+---
+
+## 4. Trade-offs
+
+| Dimensão | Benefício | Custo / Risco |
+|---|---|---|
+| Disponibilidade | Multi-AZ garante failover automático; CloudFront elimina SPOF no frontend | Custo de replicação Multi-AZ (~2× storage RDS) |
+| Escalabilidade | Auto Scaling reage a picos em segundos; Lambda é ilimitadamente elástico | Cold start de Lambda pode impactar primeiras requisições de análise de IA |
+| Segurança/Conformidade | `sa-east-1` está em conformidade com LGPD; AWS possui certificações HIPAA-eligible | Responsabilidade compartilhada: configurações incorretas de IAM/S3 são risco do cliente |
+| Custo | Fargate elimina custo de ociosidade de EC2; Lambda cobra por invocação | Fargate pode ser mais caro que EC2 Reserved em carga constante e previsível |
+| Vendor Lock-in | Integração profunda com serviços gerenciados reduz *toil* operacional | Migração futura para outro provedor exige adaptadores adicionais |
+
+---
+
+## 5. Consequências
+
+- O time de desenvolvimento pode focar em produto, não em operações de infraestrutura;
+- A plataforma atinge o SLA de 99,9% graças ao Multi-AZ e à distribuição de carga;
+- Os dados de saúde permanecem em território nacional (`sa-east-1`), facilitando a conformidade com a LGPD;
+- A arquitetura Hexagonal das Fases anteriores facilita a troca de adaptadores de infraestrutura sem reescrita do domínio.
+
+---
+
+## 6. Referências
+
+- RICHARDS, Mark; FORD, Neal. *Fundamentals of Software Architecture*. O'Reilly Media, 2020. Cap. 15 (Escalabilidade).
+- AWS. *Well-Architected Framework — Reliability Pillar*. Disponível em: https://docs.aws.amazon.com/wellarchitected/
+- PRESSMAN, Roger S. *Engenharia de Software*. McGraw Hill, 2021. Cap. 28 (Implantação e DevOps).
